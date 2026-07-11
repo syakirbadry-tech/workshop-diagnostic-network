@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS tips (
     created_at TEXT NOT NULL,
     source_case_id INTEGER,
     confirm_count INTEGER DEFAULT 0,
+    review_status TEXT NOT NULL DEFAULT 'pending', -- pending, published (admin must approve before it's visible network-wide)
     FOREIGN KEY (source_case_id) REFERENCES cases (id),
     FOREIGN KEY (workshop_id) REFERENCES workshops (id)
 );

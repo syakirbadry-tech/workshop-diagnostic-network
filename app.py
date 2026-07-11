@@ -147,6 +147,17 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def migrate(conn):
+    """Add columns to an existing (pre-upgrade) database that schema.sql's
+    CREATE TABLE IF NOT EXISTS won't retroactively add. Existing tips default
+    to 'published' so nothing already-live suddenly disappears from the
+    library; only new/promoted tips going forward start out 'pending'."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tips)")}
+    if "review_status" not in cols:
+        conn.execute("ALTER TABLE tips ADD COLUMN review_status TEXT NOT NULL DEFAULT 'published'")
+        conn.commit()
+
+
 def init_db():
     first_run = not os.path.exists(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
@@ -154,6 +165,7 @@ def init_db():
     with open(SCHEMA_PATH, "r") as f:
         conn.executescript(f.read())
     conn.commit()
+    migrate(conn)
     if first_run:
         seed(conn)
     conn.close()
@@ -187,6 +199,39 @@ def next_topic_number(conn, function_group):
         "SELECT COUNT(*) AS n FROM tips WHERE topic_number LIKE ?", (like_pattern,)
     ).fetchone()["n"] + 1
     return f"GI{code}-P-{n:06d}"
+
+
+def notify_admin_pending_tip(topic_number, title):
+    """Best-effort email to the platform admin when a new tip needs review.
+    Silently does nothing if SMTP isn't configured (SMTP_HOST/SMTP_USER/
+    SMTP_PASS env vars) - the in-app pending queue on /admin/tips always
+    works regardless, this is just an optional extra nudge. Never raises:
+    a notification failure should never block a workshop's submission."""
+    host = os.environ.get("SMTP_HOST")
+    user = os.environ.get("SMTP_USER")
+    pw = os.environ.get("SMTP_PASS")
+    to_addr = os.environ.get("SMTP_NOTIFY_TO", ADMIN_SEED_EMAIL)
+    if not (host and user and pw):
+        return
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        port = int(os.environ.get("SMTP_PORT", 587))
+        msg = MIMEText(
+            f"A new tip is waiting for your approval before it goes live on {PLATFORM_NAME}.\n\n"
+            f"Topic number: {topic_number}\n"
+            f"Title: {title}\n\n"
+            f"Review it: {os.environ.get('SITE_URL', '')}/admin/tips\n"
+        )
+        msg["Subject"] = f"[{PLATFORM_NAME}] New tip pending approval: {topic_number}"
+        msg["From"] = user
+        msg["To"] = to_addr
+        with smtplib.SMTP(host, port, timeout=10) as server:
+            server.starttls()
+            server.login(user, pw)
+            server.sendmail(user, [to_addr], msg.as_string())
+    except Exception as exc:
+        print(f"[notify_admin_pending_tip] email notification failed (non-fatal): {exc}")
 
 
 def seed(conn):
@@ -264,10 +309,10 @@ def seed(conn):
         conn.execute(
             """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
                 fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
-                created_at, source_case_id, confirm_count)
+                created_at, source_case_id, confirm_count, review_status)
                VALUES (:topic_number, :title, :category, '', :function_group, :control_unit, :fault_codes,
                 :model_series, :symptom, :diagnosis, :fix, :notes, 'Community', :workshop_id, 'Community',
-                :created_at, NULL, 0)""",
+                :created_at, NULL, 0, 'published')""",
             dict(t, workshop_id=demo_workshop_id, created_at=ts),
         )
     conn.commit()
@@ -372,7 +417,14 @@ def layout(title, active, body, flash_msg=None, flash_err=None, auth=None):
             def tab(label, href, key):
                 cls = "active" if active == key else ""
                 return f'<a href="{href}" class="{cls}">{label}</a>'
+            pending_conn = get_conn()
+            pending_count = pending_conn.execute(
+                "SELECT COUNT(*) AS n FROM tips WHERE review_status = 'pending'"
+            ).fetchone()["n"]
+            pending_conn.close()
+            pending_label = f"Pending Tips ({pending_count})" if pending_count else "Pending Tips"
             nav = (tab("Admin Dashboard", "/admin", "admin_dashboard")
+                   + tab(pending_label, "/admin/tips", "admin_tips")
                    + tab("Workshops", "/admin/workshops", "admin_workshops")
                    + tab("Support Tickets", "/admin/tickets", "admin_tickets")
                    + f'<a href="/logout">Log out</a>')
@@ -542,7 +594,7 @@ def page_tips_list(qs, auth, flash_msg=None):
     model = (qs.get("model", [""])[0]).strip()
     fault_code = (qs.get("fault_code", [""])[0]).strip()
 
-    sql = "SELECT * FROM tips WHERE 1=1"
+    sql = "SELECT * FROM tips WHERE review_status = 'published'"
     params = []
     if q:
         sql += " AND (title LIKE ? OR symptom LIKE ? OR diagnosis LIKE ? OR fix LIKE ? OR topic_number LIKE ?)"
@@ -559,7 +611,7 @@ def page_tips_list(qs, auth, flash_msg=None):
     sql += " ORDER BY created_at DESC"
 
     tips = conn.execute(sql, params).fetchall()
-    total = conn.execute("SELECT COUNT(*) AS n FROM tips").fetchone()["n"]
+    total = conn.execute("SELECT COUNT(*) AS n FROM tips WHERE review_status = 'published'").fetchone()["n"]
     conn.close()
 
     rows = ""
@@ -628,6 +680,11 @@ def page_tip_detail(tip_id, auth, flash_msg=None):
     if tip is None:
         conn.close()
         return None
+    if tip["review_status"] != "published" and tip["workshop_id"] != workshop["id"]:
+        # Pending tips are only visible to the workshop that submitted them
+        # (so they can see their own submission) until the admin approves it.
+        conn.close()
+        return None
 
     linked_cases = []
     if full_access:
@@ -638,6 +695,8 @@ def page_tip_detail(tip_id, auth, flash_msg=None):
     conn.close()
 
     meta = [chip(tip["topic_number"])]
+    if tip["review_status"] != "published":
+        meta.append(chip("Pending admin approval", "status-pending"))
     if tip["model_series"]: meta.append(chip(tip["model_series"]))
     if tip["function_group"]: meta.append(chip(tip["function_group"]))
     if tip["control_unit"]: meta.append(chip(tip["control_unit"]))
@@ -778,10 +837,12 @@ def page_cases_list(qs, auth, flash_msg=None):
     return layout("Case Log", "cases", body, flash_msg, auth=auth)
 
 
-def page_case_form(auth):
+def page_case_form(auth, err=None):
+    err_html = f'<div class="flash error">{esc(err)}</div>' if err else ""
     body = f"""
 <p><a href="/cases">&larr; Back to Case Log</a></p>
 <div class="page-head"><h2>Log New Case</h2></div>
+{err_html}
 <form class="stack panel" method="post" action="/cases/new" style="max-width:820px;">
   <div class="grid3">
     <div class="field"><label>Technician</label><input type="text" name="technician" required placeholder="Your name"></div>
@@ -790,7 +851,7 @@ def page_case_form(auth):
   </div>
   <div class="grid3">
     <div class="field"><label>Vehicle model</label><input type="text" name="vehicle_model" placeholder="e.g. S 580 e Sedan (223)"></div>
-    <div class="field"><label>VIN <span class="hint">optional</span></label><input type="text" name="vin"></div>
+    <div class="field"><label>VIN <span class="hint">required</span></label><input type="text" name="vin" required placeholder="17-character VIN"></div>
     <div class="field"><label>Mileage <span class="hint">optional</span></label><input type="text" name="mileage"></div>
   </div>
   <div class="grid2">
@@ -826,7 +887,10 @@ def page_case_detail(case_id, auth, flash_msg=None):
     if case["fault_codes"]:
         first_code = case["fault_codes"].split(",")[0].strip()
         if first_code:
-            related = conn.execute("SELECT * FROM tips WHERE fault_codes LIKE ? LIMIT 5", (f"%{first_code}%",)).fetchall()
+            related = conn.execute(
+                "SELECT * FROM tips WHERE review_status = 'published' AND fault_codes LIKE ? LIMIT 5",
+                (f"%{first_code}%",),
+            ).fetchall()
     conn.close()
 
     meta = [chip(case["vehicle_model"] or "No model given")]
@@ -917,7 +981,7 @@ def page_dashboard(auth):
     open_cases = conn.execute("SELECT COUNT(*) AS n FROM cases WHERE workshop_id=? AND status IN ('Open','In Progress')", (workshop_id,)).fetchone()["n"]
     resolved = conn.execute("SELECT COUNT(*) AS n FROM cases WHERE workshop_id=? AND status='Resolved'", (workshop_id,)).fetchone()["n"]
     resolution_rate = round((resolved / total_cases) * 100, 1) if total_cases else 0
-    network_tips = conn.execute("SELECT COUNT(*) AS n FROM tips").fetchone()["n"]
+    network_tips = conn.execute("SELECT COUNT(*) AS n FROM tips WHERE review_status = 'published'").fetchone()["n"]
 
     top_fault_codes = conn.execute(
         "SELECT fault_codes, COUNT(*) AS n FROM cases WHERE workshop_id=? AND fault_codes IS NOT NULL AND fault_codes!='' GROUP BY fault_codes ORDER BY n DESC LIMIT 8",
@@ -1088,7 +1152,8 @@ def page_admin_dashboard(auth):
     total_workshops = conn.execute("SELECT COUNT(*) AS n FROM workshops").fetchone()["n"]
     by_tier = conn.execute("SELECT tier, COUNT(*) AS n FROM workshops GROUP BY tier").fetchall()
     total_cases = conn.execute("SELECT COUNT(*) AS n FROM cases").fetchone()["n"]
-    total_tips = conn.execute("SELECT COUNT(*) AS n FROM tips").fetchone()["n"]
+    total_tips = conn.execute("SELECT COUNT(*) AS n FROM tips WHERE review_status = 'published'").fetchone()["n"]
+    pending_tips = conn.execute("SELECT COUNT(*) AS n FROM tips WHERE review_status = 'pending'").fetchone()["n"]
     open_tickets = conn.execute("SELECT COUNT(*) AS n FROM tickets WHERE status='open'").fetchone()["n"]
     recent_workshops = conn.execute("SELECT * FROM workshops ORDER BY created_at DESC LIMIT 6").fetchall()
     conn.close()
@@ -1103,12 +1168,21 @@ def page_admin_dashboard(auth):
           <div>{tier_badge(w['tier'])} <span class="chip status-{esc(w['status'])}">{esc(w['status']).title()}</span></div>
         </div>"""
 
+    pending_alert = ""
+    if pending_tips:
+        pending_alert = f"""<div class="flash" style="display:flex; align-items:center; justify-content:space-between;">
+          <span>{pending_tips} tip{'s' if pending_tips != 1 else ''} waiting for your review before {'they go' if pending_tips != 1 else 'it goes'} live in the shared library.</span>
+          <a class="btn small" href="/admin/tips">Review now</a>
+        </div>"""
+
     body = f"""
 <div class="page-head"><h2>Admin Dashboard</h2></div>
+{pending_alert}
 <div class="cards">
   <div class="card"><div class="num">{total_workshops}</div><div class="label">Workshops on the network</div></div>
   <div class="card"><div class="num">{total_cases}</div><div class="label">Total cases logged (all workshops)</div></div>
-  <div class="card"><div class="num">{total_tips}</div><div class="label">Shared tips</div></div>
+  <div class="card"><div class="num">{total_tips}</div><div class="label">Published shared tips</div></div>
+  <div class="card"><div class="num">{pending_tips}</div><div class="label">Tips pending your approval</div></div>
   <div class="card"><div class="num">{open_tickets}</div><div class="label">Open support tickets</div></div>
 </div>
 <div class="two-col">
@@ -1116,6 +1190,41 @@ def page_admin_dashboard(auth):
   <div class="panel"><h3 style="margin-top:0;">Recently signed up</h3>{rw_html or '<p class="muted small">None yet.</p>'}</div>
 </div>"""
     return layout("Admin Dashboard", "admin_dashboard", body, auth=auth)
+
+
+def page_admin_pending_tips(auth, flash_msg=None):
+    conn = get_conn()
+    pending = conn.execute("SELECT * FROM tips WHERE review_status = 'pending' ORDER BY created_at ASC").fetchall()
+    conn.close()
+
+    rows = ""
+    for t in pending:
+        rows += f"""<tr>
+          <td>{esc(t['topic_number'])}</td>
+          <td><a href="/tips/{t['id']}">{esc(t['title'])}</a></td>
+          <td class="small">{esc(t['function_group'] or '-')}</td>
+          <td class="small">{esc(t['model_series'] or '-')}</td>
+          <td class="muted small">{esc(t['created_at'])}</td>
+          <td>
+            <form method="post" action="/admin/tips/{t['id']}/approve" style="display:inline;">
+              <button class="btn small" type="submit">Approve</button>
+            </form>
+            <form method="post" action="/admin/tips/{t['id']}/reject" style="display:inline;" onsubmit="return confirm('Reject and delete this submitted tip? This cannot be undone.');">
+              <button class="btn small danger" type="submit">Reject</button>
+            </form>
+          </td>
+        </tr>"""
+
+    table = f"""<table class="list">
+        <thead><tr><th>Topic #</th><th>Title</th><th>Function group</th><th>Model series</th><th>Submitted</th><th>Action</th></tr></thead>
+        <tbody>{rows}</tbody></table>""" if pending else '<div class="panel empty">No tips waiting for review right now.</div>'
+
+    body = f"""
+<div class="page-head"><h2>Pending Tips <span class="count">{len(pending)} awaiting review</span></h2></div>
+<p class="muted small">These were submitted by workshops (new tips, or cases promoted into the shared library) and
+are not yet visible to any subscriber. Approve to publish network-wide, or reject to discard.</p>
+{table}"""
+    return layout("Pending Tips", "admin_tips", body, flash_msg, auth=auth)
 
 
 def page_admin_workshops(auth, flash_msg=None):
@@ -1348,7 +1457,7 @@ def handle_get(path, qs, cookie_header):
             if not a: return resp_redirect("/login")
             if not tier_at_least(a["workshop"], "basic"):
                 return resp_redirect("/account")
-            rows = conn.execute("SELECT id,topic_number,title,category,function_group,control_unit,fault_codes,model_series,symptom,diagnosis,fix,notes,confirm_count,created_at FROM tips ORDER BY created_at DESC").fetchall()
+            rows = conn.execute("SELECT id,topic_number,title,category,function_group,control_unit,fault_codes,model_series,symptom,diagnosis,fix,notes,confirm_count,created_at FROM tips WHERE review_status = 'published' ORDER BY created_at DESC").fetchall()
             return resp_csv(csv_bytes(rows), "tips_export.csv")
         if path.startswith("/tips/"):
             a = workshop_auth(cookie_header, conn)
@@ -1371,7 +1480,7 @@ def handle_get(path, qs, cookie_header):
             if not a: return resp_redirect("/login")
             if not tier_at_least(a["workshop"], "basic"):
                 return resp_redirect("/account")
-            return resp_html(page_case_form(a))
+            return resp_html(page_case_form(a, err))
         if path == "/cases/export.csv":
             a = workshop_auth(cookie_header, conn)
             if not a: return resp_redirect("/login")
@@ -1424,6 +1533,10 @@ def handle_get(path, qs, cookie_header):
             a = admin_auth(cookie_header, conn)
             if not a: return resp_redirect("/login")
             return resp_html(page_admin_dashboard(a))
+        if path == "/admin/tips":
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_admin_pending_tips(a, msg))
         if path == "/admin/workshops":
             a = admin_auth(cookie_header, conn)
             if not a: return resp_redirect("/login")
@@ -1503,20 +1616,23 @@ def handle_post(path, f, cookie_header):
             conn.execute(
                 """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
                     fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
-                    created_at, confirm_count)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                    created_at, confirm_count, review_status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'pending')""",
                 (topic_number, f("title"), f("category"), f("subcategory"), f("function_group"), f("control_unit"),
                  f("fault_codes"), f("model_series"), f("symptom"), f("diagnosis"), f("fix"), f("notes"),
                  "Community", a["workshop"]["id"], a["user"]["name"], now_str()),
             )
             conn.commit()
-            return resp_redirect("/tips?msg=Tip added to the shared library.")
+            notify_admin_pending_tip(topic_number, f("title"))
+            return resp_redirect("/tips?msg=Tip submitted - it will appear in the shared library once approved by the platform admin.")
 
         if path == "/cases/new":
             a = workshop_auth(cookie_header, conn)
             if not a: return resp_redirect("/login")
             if not tier_at_least(a["workshop"], "basic"):
                 return resp_redirect("/account")
+            if not f("vin").strip():
+                return resp_html(page_case_form(a, "VIN is required before a case can be logged."))
             workshop_id = a["workshop"]["id"]
             n = conn.execute("SELECT COUNT(*) AS n FROM cases WHERE workshop_id=?", (workshop_id,)).fetchone()["n"] + 1
             case_number = f"WS{workshop_id}-CASE-{n:04d}"
@@ -1549,8 +1665,8 @@ def handle_post(path, f, cookie_header):
             cur = conn.execute(
                 """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
                     fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
-                    created_at, source_case_id, confirm_count)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                    created_at, source_case_id, confirm_count, review_status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'pending')""",
                 (topic_number, title, "", "", case["function_group"], case["control_unit"], case["fault_codes"],
                  case["vehicle_model"], case["symptom"], case["diagnosis_steps"], case["fix_applied"],
                  f"Promoted from a workshop's case log.", "Community", a["workshop"]["id"], a["user"]["name"],
@@ -1559,7 +1675,8 @@ def handle_post(path, f, cookie_header):
             new_tip_id = cur.lastrowid
             conn.execute("UPDATE cases SET linked_tip_id=? WHERE id=?", (new_tip_id, case_id))
             conn.commit()
-            return resp_redirect(f"/tips/{new_tip_id}?msg=Case {case['case_number']} promoted to shared Tip {topic_number}.")
+            notify_admin_pending_tip(topic_number, title)
+            return resp_redirect(f"/tips/{new_tip_id}?msg=Case {case['case_number']} submitted as {topic_number} - it will appear in the shared library once approved by the platform admin.")
 
         if path.startswith("/cases/") and path.endswith("/link"):
             a = workshop_auth(cookie_header, conn)
@@ -1624,6 +1741,29 @@ def handle_post(path, f, cookie_header):
                 conn.execute("UPDATE workshops SET tier=?, status=? WHERE id=?", (tier, status, workshop_id))
                 conn.commit()
             return resp_redirect("/admin/workshops?msg=Workshop updated.")
+
+        if path.startswith("/admin/tips/") and path.endswith("/approve"):
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            tip_id = int(path.split("/")[3])
+            tip = conn.execute("SELECT * FROM tips WHERE id=?", (tip_id,)).fetchone()
+            if tip is None:
+                return resp_not_found(a)
+            conn.execute("UPDATE tips SET review_status='published' WHERE id=?", (tip_id,))
+            conn.commit()
+            return resp_redirect(f"/admin/tips?msg=Tip {tip['topic_number']} approved and published to the network.")
+
+        if path.startswith("/admin/tips/") and path.endswith("/reject"):
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            tip_id = int(path.split("/")[3])
+            tip = conn.execute("SELECT * FROM tips WHERE id=?", (tip_id,)).fetchone()
+            if tip is None:
+                return resp_not_found(a)
+            conn.execute("UPDATE cases SET linked_tip_id=NULL WHERE linked_tip_id=?", (tip_id,))
+            conn.execute("DELETE FROM tips WHERE id=?", (tip_id,))
+            conn.commit()
+            return resp_redirect(f"/admin/tips?msg=Tip {tip['topic_number']} rejected and removed.")
 
         if path.startswith("/admin/tickets/") and path.endswith("/reply"):
             a = admin_auth(cookie_header, conn)

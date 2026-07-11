@@ -155,12 +155,38 @@ not unless you pay for a disk/volume.
   land in the same Tips library that every other subscriber searches. The
   more workshops you sign up, the more valuable it gets for everyone — this
   is the core value loop of the product.
+- **Reviewing and approving tips**: new tips (manually added, or promoted
+  from a workshop's case) don't go straight into the shared library — they
+  sit in a **pending** queue at `/admin/tips` until you approve them. The
+  admin nav shows a live count of tips waiting for review, and the admin
+  dashboard flags it too. Approve to publish network-wide, or reject to
+  discard (rejecting also unlinks it from the source case, if any).
+- **Topic numbers**: tips are numbered starting with their function group
+  code, matching the real Xentry Tips convention — e.g. a Battery-related
+  tip (function group 54) is `GI54-P-000001`, an Automatic transmission tip
+  (function group 27) is `GI27-P-000001`. Numbering is scoped per group.
+- **VIN is required** when logging a case (`/cases/new`) — a case can't be
+  saved without one.
+- **Optional email alert on new pending tips**: by default you'll only see
+  pending tips by checking `/admin/tips` (the nav badge makes this easy).
+  If you'd like an email the moment a new tip needs review, set these
+  environment variables on your host (same place you set `DB_PATH`):
+  - `SMTP_HOST`, `SMTP_PORT` (defaults to 587), `SMTP_USER`, `SMTP_PASS` —
+    credentials for an SMTP account (e.g. a Gmail account with an
+    [App Password](https://myaccount.google.com/apppasswords)).
+  - `SMTP_NOTIFY_TO` (optional) — where the alert goes; defaults to your
+    admin email.
+  - `SITE_URL` (optional) — included in the email as a clickable link back
+    to `/admin/tips`.
+  If these aren't set, the app just skips sending email — everything else
+  works the same, you'd just rely on checking the nav badge.
 - **Backups**: `workshop_network.db` is the entire database. Download/copy
   it periodically (however your host lets you access files) and keep dated
   backups somewhere safe.
 - **CSV export**: Basic+ workshops can export their own Tips view and case
   log as CSV from the Tips Library / Case Log pages — handy if you want to
-  pull data into Excel for your own reporting too.
+  pull data into Excel for your own reporting too. (Exports only include
+  published tips.)
 
 ---
 
