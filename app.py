@@ -175,6 +175,20 @@ def next_number(conn, table, prefix):
     return f"{prefix}-{n:04d}"
 
 
+def next_topic_number(conn, function_group):
+    """Topic numbers follow the real Xentry Tips convention: they start with
+    the function group's numeric code, e.g. a Battery-related tip (function
+    group 54) gets a number like GI54-P-000001, an Automatic transmission
+    tip (function group 27) gets GI27-P-000001. The counter is scoped per
+    function group so each group's numbering starts at 1."""
+    code = (function_group or "00 - Overall vehicle").split(" - ")[0].strip() or "00"
+    like_pattern = f"GI{code}-P-%"
+    n = conn.execute(
+        "SELECT COUNT(*) AS n FROM tips WHERE topic_number LIKE ?", (like_pattern,)
+    ).fetchone()["n"] + 1
+    return f"GI{code}-P-{n:06d}"
+
+
 def seed(conn):
     ts = now_str()
 
@@ -224,21 +238,21 @@ def seed(conn):
     )
 
     sample_tips = [
-        dict(topic_number="WN-32-0001", title="Front axle creak over speed bumps - check strut top mount",
+        dict(topic_number="GI32-P-000001", title="Front axle creak over speed bumps - check strut top mount",
              category="Chassis/suspension", function_group="32 - Suspension", control_unit="", fault_codes="",
              model_series="W205, W213",
              symptom="Creaking/knocking noise from front suspension over bumps or slow steering input.",
              diagnosis="Road test to confirm noise, isolate side, inspect strut top mounts and sway bar end links with vehicle on lift.",
              fix="Replaced worn strut top mount bearing. Noise gone on re-test.",
              notes="Sample entry - community-contributed, not an official Mercedes-Benz publication."),
-        dict(topic_number="WN-27-0002", title="Harsh 1-2 gear shift after cold start",
+        dict(topic_number="GI27-P-000001", title="Harsh 1-2 gear shift after cold start",
              category="Power transmission", function_group="27 - Automatic transmission", control_unit="Transmission control unit",
              fault_codes="", model_series="W167, C167",
              symptom="Jolt/harsh shift 1-2 only in first few minutes after cold start, smooths out once warm.",
              diagnosis="Checked transmission fluid condition/level, pulled adaptation values, reviewed fault memory (none stored).",
              fix="Performed transmission adaptation reset per service procedure.",
              notes="Sample entry - community-contributed."),
-        dict(topic_number="WN-54-0003", title="Instrument cluster blank on cold mornings",
+        dict(topic_number="GI54-P-000001", title="Instrument cluster blank on cold mornings",
              category="Communication/information", function_group="54 - Instrument cluster / display", control_unit="Instrument cluster",
              fault_codes="", model_series="W213, W223",
              symptom="Cluster stays blank for 5-10 seconds after start on cold days, then boots normally.",
@@ -1485,7 +1499,7 @@ def handle_post(path, f, cookie_header):
             if not a: return resp_redirect("/login")
             if not tier_at_least(a["workshop"], "basic"):
                 return resp_redirect("/account")
-            topic_number = next_number(conn, "tips", "WN")
+            topic_number = next_topic_number(conn, f("function_group"))
             conn.execute(
                 """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
                     fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
@@ -1530,7 +1544,7 @@ def handle_post(path, f, cookie_header):
             case = conn.execute("SELECT * FROM cases WHERE id=? AND workshop_id=?", (case_id, a["workshop"]["id"])).fetchone()
             if case is None:
                 return resp_not_found(a)
-            topic_number = next_number(conn, "tips", "WN")
+            topic_number = next_topic_number(conn, case["function_group"])
             title = f("title") or (case["symptom"] or "")[:70]
             cur = conn.execute(
                 """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
