@@ -48,59 +48,95 @@ not for real subscribers. For that, you need Part 2.
 
 ## Part 2 — Put it on the internet (so workshops elsewhere can sign up)
 
-This app is a plain Python script that listens on a port — it runs
-perfectly on any host that can run `python3 app.py` continuously. Two good
-options, easiest first:
+The app supports two ways of running, both from the exact same `app.py`:
 
-### Option A: Render.com (recommended to start)
+- **Direct script mode** — `python3 app.py` binds its own port. Works on a
+  VPS or any host that just runs a long-lived Python process.
+- **WSGI mode** — `app.py` also exposes a standard `application(environ,
+  start_response)` callable near the bottom of the file. This is what
+  free, no-credit-card hosts like PythonAnywhere require, since they run
+  your code inside their own web server rather than letting it bind a port.
 
-1. Put this folder in a GitHub repository (create a free GitHub account if
-   needed, create a new repo, upload these files).
-2. Go to [render.com](https://render.com), sign up, click **New → Web
-   Service**, and connect your GitHub repo.
-3. Configure:
-   - **Runtime**: Python 3
-   - **Build Command**: *(leave blank — no dependencies to install)*
-   - **Start Command**: `python3 app.py`
-   - Render automatically sets a `PORT` environment variable; this app
-     already reads it (`app.py` uses `os.environ.get("PORT", 5000)`), so no
-     changes needed.
-4. **Important — add a persistent disk.** By default, Render's filesystem is
-   wiped every time you redeploy, which would delete your database. Under
-   your service's **Disks** settings, add a persistent disk (a few dollars a
-   month for 1 GB is plenty for a long time) mounted at, e.g., `/data`. Then
-   add an environment variable so the app stores its database there instead
-   of next to the code:
-   - **Key**: `DB_PATH`   **Value**: `/data/workshop_network.db`
-   - The app already reads this variable (see `DB_PATH` near the top of
-     `app.py`) — no code changes needed, just set the environment variable
-     in Render's dashboard.
-5. Deploy. Render gives you a public URL like `https://your-app.onrender.com`
-   — that's what you share with workshops.
-6. Check the **Logs** tab after first deploy to grab the admin password
-   that gets printed on first run (do this immediately, since free/starter
-   log retention is limited).
-7. Add a custom domain later under **Settings → Custom Domains** if you want
-   something like `app.yourbrand.com`.
+### Option A: PythonAnywhere (recommended — free, no card required)
 
-### Option B: Railway.app
+This is the easiest fully-free option: no card, and the disk is persistent
+by default (nothing gets wiped on redeploy).
 
-Same idea as Render — connect your GitHub repo, set the start command to
-`python3 app.py`, and attach a persistent **Volume** (Railway's equivalent
-of a persistent disk) so `workshop_network.db` survives redeploys.
+1. Go to [pythonanywhere.com](https://www.pythonanywhere.com) and sign up
+   for a **Beginner (free)** account — email + password only, no card.
+2. Once logged in, open a **Bash console** from the Dashboard and clone your
+   GitHub repo:
+   ```
+   git clone https://github.com/syakirbadry-tech/workshop-diagnostic-network.git
+   ```
+   (If the repo is private, PythonAnywhere will prompt for a GitHub
+   username + a [personal access token](https://github.com/settings/tokens)
+   instead of a password.)
+3. Go to the **Web** tab → **Add a new web app** → pick your free domain
+   (`yourusername.pythonanywhere.com`) → choose **Manual configuration**
+   (not a framework preset) → **Python 3.10**.
+4. On the Web tab, find **Code → WSGI configuration file** and click it to
+   edit. Delete the placeholder content and replace it with:
+   ```python
+   import sys
+   import os
 
-### Option C: A basic VPS (DigitalOcean, Linode, a spare machine, etc.)
+   project_home = '/home/yourusername/workshop-diagnostic-network'
+   if project_home not in sys.path:
+       sys.path.insert(0, project_home)
+
+   os.environ['DB_PATH'] = '/home/yourusername/workshop-diagnostic-network/workshop_network.db'
+
+   from app import application
+   ```
+   Replace `yourusername` with your actual PythonAnywhere username (shown
+   top-right of the dashboard). This tells PythonAnywhere to import
+   `application` from `app.py` instead of running it as a script — and
+   pins the database to a path on PythonAnywhere's persistent filesystem
+   (your account's home directory is never wiped).
+5. Back on the **Web** tab, set **Static files**: URL `/static/` → Directory
+   `/home/yourusername/workshop-diagnostic-network/static/` (this makes
+   `style.css` load fast, though the app can also serve it itself).
+6. Click the big green **Reload** button on the Web tab.
+7. Visit `https://yourusername.pythonanywhere.com` — that's your public URL,
+   shareable with any workshop, anywhere.
+8. Grab the admin password: open a Bash console and run
+   `cat ~/workshop-diagnostic-network/ADMIN_CREDENTIALS.txt` — it's created
+   automatically the first time the app runs (i.e., the first page load
+   after your first Reload).
+9. **Free-tier limits to know**: PythonAnywhere's free plan sleeps your app
+   if it gets no traffic for a while and wakes it on the next request (a
+   few seconds' delay), and it doesn't support a custom domain. Both are
+   fine to start with — when you have paying workshops, PythonAnywhere's
+   paid "Hacker" plan ($5/mo) removes both restrictions and doesn't need a
+   different payment flow than any other subscription (a normal card would
+   work here, or you can stay on free indefinitely if that's not a
+   priority).
+
+### Option B: A basic VPS (DigitalOcean, Linode, a spare machine, etc.)
 
 If you want full control: rent the cheapest droplet/VPS, install Python 3,
 copy this folder over (`scp` or `git clone`), and run it permanently with
 either `tmux`/`screen` or, better, a `systemd` service so it restarts
-automatically on reboot or crash. This avoids any "ephemeral disk" gotchas
-entirely, since a VPS's disk is just a normal persistent disk. Ask if you'd
-like the exact `systemd` unit file for this — it's a handful of lines.
+automatically on reboot or crash — `python3 app.py` (direct script mode)
+is what you'd run here. This avoids any "ephemeral disk" gotchas entirely,
+since a VPS's disk is just a normal persistent disk. Ask if you'd like the
+exact `systemd` unit file for this — it's a handful of lines.
+
+### Option C: Render.com or Railway.app (need a working card on file)
+
+Same `python3 app.py` direct-script approach works here too (Start Command:
+`python3 app.py`, no Build Command needed). Both require a payment card on
+file even to provision their free/starter compute, and both wipe local disk
+on redeploy unless you pay for a persistent disk/volume with `DB_PATH` (or
+Railway's Volume equivalent) pointed at it. Worth revisiting later if you
+want a custom domain or more headroom than PythonAnywhere's free tier, but
+PythonAnywhere is the simplest path to get live today.
 
 **Whichever host you pick:** don't launch to real paying customers on any
 "free tier with ephemeral storage" — you will eventually lose the database.
-Either pay for persistent disk/volume, or use a VPS.
+PythonAnywhere's free tier is persistent by default; Render/Railway's is
+not unless you pay for a disk/volume.
 
 ---
 
@@ -167,6 +203,9 @@ statuses are also editable lists near the top of `app.py`.
 ## Files in this folder
 
 - `app.py` — the entire application (routing, pages, auth, tiering, admin).
+  Runs standalone with `python3 app.py`, and also exposes a WSGI
+  `application` callable for hosts like PythonAnywhere that import it as a
+  module instead.
 - `schema.sql` — database structure, applied automatically on first run.
 - `static/style.css` — all styling.
 - `workshop_network.db` — created automatically on first run; this is your

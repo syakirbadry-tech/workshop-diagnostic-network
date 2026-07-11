@@ -254,20 +254,22 @@ def tier_at_least(workshop, min_tier):
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-def parse_cookies(handler):
-    header = handler.headers.get("Cookie")
+def parse_cookie_header(cookie_header):
     cookies = {}
-    if header:
-        for part in header.split(";"):
+    if cookie_header:
+        for part in cookie_header.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
                 cookies[k] = v
     return cookies
 
 
-def get_auth(handler, conn):
-    """Returns dict(user=Row, workshop=Row or None) or None if not logged in."""
-    token = parse_cookies(handler).get("session")
+def get_auth(cookie_header, conn):
+    """Returns dict(user=Row, workshop=Row or None) or None if not logged in.
+    cookie_header is the raw Cookie header string (or None) - this function is
+    transport-agnostic so it works the same whether the request came in via
+    the built-in socket server or a WSGI host like PythonAnywhere."""
+    token = parse_cookie_header(cookie_header).get("session")
     if not token:
         return None
     row = conn.execute(
@@ -1175,7 +1177,463 @@ def csv_bytes(rows):
 
 
 # ---------------------------------------------------------------------------
-# HTTP server / routing
+# Response helper (transport-agnostic)
+# ---------------------------------------------------------------------------
+
+class Resp:
+    """A tiny response container shared by the built-in socket server and
+    the WSGI adapter (for hosts like PythonAnywhere), so all the routing
+    logic below only has to be written once."""
+
+    def __init__(self, status=200, body=b"", content_type="text/html; charset=utf-8", headers=None):
+        self.status = status
+        self.body = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        self.content_type = content_type
+        self.headers = headers or {}
+
+
+STATUS_TEXT = {200: "OK", 303: "See Other", 403: "Forbidden", 404: "Not Found"}
+
+
+def resp_html(html, status=200):
+    return Resp(status, html, "text/html; charset=utf-8")
+
+
+def resp_redirect(location, set_cookie=None, clear_cookie=False):
+    headers = {"Location": location}
+    if set_cookie:
+        headers["Set-Cookie"] = SESSION_COOKIE_TMPL.format(token=set_cookie, max_age=SESSION_DAYS * 86400)
+    if clear_cookie:
+        headers["Set-Cookie"] = "session=; Path=/; HttpOnly; Max-Age=0"
+    return Resp(303, b"", headers=headers)
+
+
+def resp_csv(content_bytes, filename):
+    return Resp(200, content_bytes, "text/csv", {"Content-Disposition": f"attachment; filename={filename}"})
+
+
+def resp_not_found(auth=None):
+    return resp_html(layout("Not found", "", '<div class="panel empty">Page not found.</div>', auth=auth), 404)
+
+
+def resp_static(path):
+    rel = path[len("/static/"):]
+    full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+    if not full.startswith(STATIC_DIR) or not os.path.isfile(full):
+        return resp_not_found()
+    ctype = "text/css" if full.endswith(".css") else "application/octet-stream"
+    with open(full, "rb") as fh:
+        return Resp(200, fh.read(), content_type=ctype)
+
+
+def workshop_auth(cookie_header, conn):
+    """Returns the auth dict for a logged-in workshop user, or None."""
+    auth = get_auth(cookie_header, conn)
+    if auth is None or auth["user"]["role"] == "platform_admin" or auth["workshop"] is None:
+        return None
+    return auth
+
+
+def admin_auth(cookie_header, conn):
+    auth = get_auth(cookie_header, conn)
+    if auth is None or auth["user"]["role"] != "platform_admin":
+        return None
+    return auth
+
+
+# ---------------------------------------------------------------------------
+# Routing - GET (transport-agnostic: used by both the socket server and WSGI)
+# ---------------------------------------------------------------------------
+
+def handle_get(path, qs, cookie_header):
+    if path.startswith("/static/"):
+        return resp_static(path)
+
+    conn = get_conn()
+    try:
+        auth = get_auth(cookie_header, conn)
+        msg = qs.get("msg", [None])[0]
+        err = qs.get("err", [None])[0]
+
+        if path in ("/", ""):
+            if auth is None:
+                return resp_html(page_landing())
+            if auth["user"]["role"] == "platform_admin":
+                return resp_redirect("/admin")
+            return resp_redirect("/tips")
+
+        if path == "/signup":
+            if auth:
+                return resp_redirect("/tips")
+            return resp_html(page_signup(err))
+        if path == "/login":
+            if auth:
+                return resp_redirect("/admin" if auth["user"]["role"] == "platform_admin" else "/tips")
+            return resp_html(page_login(err))
+        if path == "/logout":
+            return resp_redirect("/", clear_cookie=True)
+
+        # ---- workshop area ----
+        if path == "/tips":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_tips_list(qs, a, msg))
+        if path == "/tips/new":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            return resp_html(page_tip_form(a))
+        if path == "/tips/export.csv":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            rows = conn.execute("SELECT id,topic_number,title,category,function_group,control_unit,fault_codes,model_series,symptom,diagnosis,fix,notes,confirm_count,created_at FROM tips ORDER BY created_at DESC").fetchall()
+            return resp_csv(csv_bytes(rows), "tips_export.csv")
+        if path.startswith("/tips/"):
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            try:
+                tip_id = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return resp_not_found(a)
+            html_out = page_tip_detail(tip_id, a, msg)
+            return resp_html(html_out) if html_out else resp_not_found(a)
+
+        if path == "/cases":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            return resp_html(page_cases_list(qs, a, msg))
+        if path == "/cases/new":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            return resp_html(page_case_form(a))
+        if path == "/cases/export.csv":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            rows = conn.execute("SELECT * FROM cases WHERE workshop_id=? ORDER BY created_at DESC", (a["workshop"]["id"],)).fetchall()
+            return resp_csv(csv_bytes(rows), "cases_export.csv")
+        if path.startswith("/cases/"):
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            try:
+                case_id = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return resp_not_found(a)
+            html_out = page_case_detail(case_id, a, msg)
+            return resp_html(html_out) if html_out else resp_not_found(a)
+
+        if path == "/dashboard":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_dashboard(a))
+
+        if path == "/account":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_account(a, msg))
+
+        if path == "/support":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "premium"):
+                return resp_html(page_support_locked(a))
+            return resp_html(page_support_list(a, msg))
+        if path.startswith("/support/"):
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "premium"):
+                return resp_html(page_support_locked(a))
+            try:
+                ticket_id = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return resp_not_found(a)
+            html_out = page_support_thread(ticket_id, a, msg)
+            return resp_html(html_out) if html_out else resp_not_found(a)
+
+        # ---- admin area ----
+        if path == "/admin":
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_admin_dashboard(a))
+        if path == "/admin/workshops":
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_admin_workshops(a, msg))
+        if path == "/admin/tickets":
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            return resp_html(page_admin_tickets(qs, a))
+        if path.startswith("/admin/tickets/"):
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            try:
+                ticket_id = int(path.split("/")[3])
+            except (IndexError, ValueError):
+                return resp_not_found(a)
+            html_out = page_admin_ticket_thread(ticket_id, a, msg)
+            return resp_html(html_out) if html_out else resp_not_found(a)
+
+        return resp_not_found(auth)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Routing - POST (transport-agnostic: used by both the socket server and WSGI)
+# ---------------------------------------------------------------------------
+
+def handle_post(path, f, cookie_header):
+    conn = get_conn()
+    try:
+        if path == "/signup":
+            name = f("workshop_name").strip()
+            owner_name = f("owner_name").strip()
+            email = f("email").strip().lower()
+            password = f("password")
+            city = f("city").strip()
+            phone = f("phone").strip()
+            if not (name and owner_name and email and password):
+                return resp_html(page_signup("Please fill in all required fields.",
+                                              dict(workshop_name=name, owner_name=owner_name, email=email, city=city, phone=phone)))
+            existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+            if existing:
+                return resp_html(page_signup("That email is already registered. Try logging in instead.",
+                                              dict(workshop_name=name, owner_name=owner_name, email=email, city=city, phone=phone)))
+            ts = now_str()
+            cur = conn.execute(
+                "INSERT INTO workshops (name, city, contact_email, phone, tier, status, created_at) VALUES (?,?,?,?,'free','active',?)",
+                (name, city, email, phone, ts),
+            )
+            workshop_id = cur.lastrowid
+            h, s = hash_password(password)
+            cur2 = conn.execute(
+                "INSERT INTO users (workshop_id, name, email, password_hash, password_salt, role, created_at) VALUES (?,?,?,?,?,'owner',?)",
+                (workshop_id, owner_name, email, h, s, ts),
+            )
+            conn.commit()
+            token = create_session(conn, cur2.lastrowid)
+            return resp_redirect("/tips?msg=Welcome! You're on the Free tier - browse the Tips library, and upgrade any time from Account.", set_cookie=token)
+
+        if path == "/login":
+            email = f("email").strip().lower()
+            password = f("password")
+            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            if not user or not verify_password(password, user["password_hash"], user["password_salt"]):
+                return resp_html(page_login("Incorrect email or password.", email))
+            token = create_session(conn, user["id"])
+            dest = "/admin" if user["role"] == "platform_admin" else "/tips"
+            return resp_redirect(dest, set_cookie=token)
+
+        # ---- workshop actions ----
+        if path == "/tips/new":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            topic_number = next_number(conn, "tips", "WN")
+            conn.execute(
+                """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
+                    fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
+                    created_at, confirm_count)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                (topic_number, f("title"), f("category"), f("subcategory"), f("function_group"), f("control_unit"),
+                 f("fault_codes"), f("model_series"), f("symptom"), f("diagnosis"), f("fix"), f("notes"),
+                 "Community", a["workshop"]["id"], a["user"]["name"], now_str()),
+            )
+            conn.commit()
+            return resp_redirect("/tips?msg=Tip added to the shared library.")
+
+        if path == "/cases/new":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            workshop_id = a["workshop"]["id"]
+            n = conn.execute("SELECT COUNT(*) AS n FROM cases WHERE workshop_id=?", (workshop_id,)).fetchone()["n"] + 1
+            case_number = f"WS{workshop_id}-CASE-{n:04d}"
+            time_val = f("time_spent_hours")
+            conn.execute(
+                """INSERT INTO cases (workshop_id, case_number, technician, case_date, vehicle_model, vin, mileage,
+                    function_group, control_unit, fault_codes, symptom, diagnosis_steps, root_cause, fix_applied,
+                    parts_used, time_spent_hours, status, notes, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (workshop_id, case_number, f("technician"), f("case_date") or datetime.now().strftime("%Y-%m-%d"),
+                 f("vehicle_model"), f("vin"), f("mileage"), f("function_group"), f("control_unit"),
+                 f("fault_codes"), f("symptom"), f("diagnosis_steps"), f("root_cause"), f("fix_applied"),
+                 f("parts_used"), float(time_val) if time_val else None, f("status") or "Open",
+                 f("notes"), now_str()),
+            )
+            conn.commit()
+            return resp_redirect(f"/cases?msg=Case {case_number} logged.")
+
+        if path.startswith("/cases/") and path.endswith("/promote"):
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            case_id = int(path.split("/")[2])
+            case = conn.execute("SELECT * FROM cases WHERE id=? AND workshop_id=?", (case_id, a["workshop"]["id"])).fetchone()
+            if case is None:
+                return resp_not_found(a)
+            topic_number = next_number(conn, "tips", "WN")
+            title = f("title") or (case["symptom"] or "")[:70]
+            cur = conn.execute(
+                """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
+                    fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
+                    created_at, source_case_id, confirm_count)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                (topic_number, title, "", "", case["function_group"], case["control_unit"], case["fault_codes"],
+                 case["vehicle_model"], case["symptom"], case["diagnosis_steps"], case["fix_applied"],
+                 f"Promoted from a workshop's case log.", "Community", a["workshop"]["id"], a["user"]["name"],
+                 now_str(), case["id"]),
+            )
+            new_tip_id = cur.lastrowid
+            conn.execute("UPDATE cases SET linked_tip_id=? WHERE id=?", (new_tip_id, case_id))
+            conn.commit()
+            return resp_redirect(f"/tips/{new_tip_id}?msg=Case {case['case_number']} promoted to shared Tip {topic_number}.")
+
+        if path.startswith("/cases/") and path.endswith("/link"):
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "basic"):
+                return resp_redirect("/account")
+            case_id = int(path.split("/")[2])
+            case = conn.execute("SELECT * FROM cases WHERE id=? AND workshop_id=?", (case_id, a["workshop"]["id"])).fetchone()
+            if case is None:
+                return resp_not_found(a)
+            tip_id = f("tip_id")
+            if tip_id:
+                conn.execute("UPDATE cases SET linked_tip_id=? WHERE id=?", (tip_id, case_id))
+                conn.execute("UPDATE tips SET confirm_count = confirm_count + 1 WHERE id=?", (tip_id,))
+                conn.commit()
+            return resp_redirect(f"/cases/{case_id}?msg=Linked to shared tip and confirmation count updated.")
+
+        if path == "/support/new":
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "premium"):
+                return resp_redirect("/account")
+            ts = now_str()
+            cur = conn.execute(
+                "INSERT INTO tickets (workshop_id, subject, vehicle_model, status, created_at, updated_at) VALUES (?,?,?,'open',?,?)",
+                (a["workshop"]["id"], f("subject"), f("vehicle_model"), ts, ts),
+            )
+            ticket_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO ticket_messages (ticket_id, sender_role, sender_name, message, created_at) VALUES (?,?,?,?,?)",
+                (ticket_id, "workshop", a["user"]["name"], f("message"), ts),
+            )
+            conn.commit()
+            return resp_redirect(f"/support/{ticket_id}?msg=Support ticket sent.")
+
+        if path.startswith("/support/") and path.endswith("/reply"):
+            a = workshop_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            if not tier_at_least(a["workshop"], "premium"):
+                return resp_redirect("/account")
+            ticket_id = int(path.split("/")[2])
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=? AND workshop_id=?", (ticket_id, a["workshop"]["id"])).fetchone()
+            if ticket is None:
+                return resp_not_found(a)
+            ts = now_str()
+            conn.execute(
+                "INSERT INTO ticket_messages (ticket_id, sender_role, sender_name, message, created_at) VALUES (?,?,?,?,?)",
+                (ticket_id, "workshop", a["user"]["name"], f("message"), ts),
+            )
+            conn.execute("UPDATE tickets SET status='open', updated_at=? WHERE id=?", (ts, ticket_id))
+            conn.commit()
+            return resp_redirect(f"/support/{ticket_id}?msg=Message sent.")
+
+        # ---- admin actions ----
+        if path.startswith("/admin/workshops/") and path.endswith("/update"):
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            workshop_id = int(path.split("/")[3])
+            tier = f("tier")
+            status = f("status")
+            if tier in TIER_RANK and status in WORKSHOP_STATUSES:
+                conn.execute("UPDATE workshops SET tier=?, status=? WHERE id=?", (tier, status, workshop_id))
+                conn.commit()
+            return resp_redirect("/admin/workshops?msg=Workshop updated.")
+
+        if path.startswith("/admin/tickets/") and path.endswith("/reply"):
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            ticket_id = int(path.split("/")[3])
+            ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if ticket is None:
+                return resp_not_found(a)
+            ts = now_str()
+            conn.execute(
+                "INSERT INTO ticket_messages (ticket_id, sender_role, sender_name, message, created_at) VALUES (?,'admin',?,?,?)",
+                (ticket_id, a["user"]["name"], f("message"), ts),
+            )
+            conn.execute("UPDATE tickets SET status='answered', updated_at=? WHERE id=?", (ts, ticket_id))
+            conn.commit()
+            return resp_redirect(f"/admin/tickets/{ticket_id}?msg=Reply sent.")
+
+        if path.startswith("/admin/tickets/") and path.endswith("/close"):
+            a = admin_auth(cookie_header, conn)
+            if not a: return resp_redirect("/login")
+            ticket_id = int(path.split("/")[3])
+            conn.execute("UPDATE tickets SET status='closed', updated_at=? WHERE id=?", (now_str(), ticket_id))
+            conn.commit()
+            return resp_redirect(f"/admin/tickets/{ticket_id}?msg=Ticket closed.")
+
+        return resp_not_found()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# WSGI adapter - for hosts that expect a standard WSGI callable rather than
+# letting the app bind its own socket (this is what PythonAnywhere's free
+# tier requires). Point PythonAnywhere's generated WSGI config file at this
+# with: from app import application
+# ---------------------------------------------------------------------------
+
+def application(environ, start_response):
+    method = environ.get("REQUEST_METHOD", "GET")
+    path = environ.get("PATH_INFO", "/") or "/"
+    query_string = environ.get("QUERY_STRING", "")
+    cookie_header = environ.get("HTTP_COOKIE")
+
+    if path.startswith("/static/"):
+        resp = resp_static(path)
+    elif method == "POST":
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+        except ValueError:
+            length = 0
+        raw = environ["wsgi.input"].read(length) if length else b""
+        form = parse_qs(raw.decode("utf-8"))
+        f = lambda key, default="": form.get(key, [default])[0]
+        resp = handle_post(path, f, cookie_header)
+    else:
+        qs = parse_qs(query_string)
+        resp = handle_get(path, qs, cookie_header)
+
+    status_line = f"{resp.status} {STATUS_TEXT.get(resp.status, 'OK')}"
+    headers = [("Content-Type", resp.content_type), ("Content-Length", str(len(resp.body)))]
+    for k, v in resp.headers.items():
+        headers.append((k, v))
+    start_response(status_line, headers)
+    return [resp.body]
+
+
+# ---------------------------------------------------------------------------
+# Built-in socket server - for local use, a plain VPS, or any host that
+# simply runs "python3 app.py" directly (Render, Railway, etc.).
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -1184,418 +1642,34 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, status, content, content_type="text/html; charset=utf-8", extra_headers=None):
-        body = content.encode("utf-8") if isinstance(content, str) else content
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra_headers or {}).items():
+    def _write(self, resp):
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.content_type)
+        self.send_header("Content-Length", str(len(resp.body)))
+        for k, v in resp.headers.items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
-
-    def _redirect(self, location, set_cookie=None, clear_cookie=False):
-        self.send_response(303)
-        self.send_header("Location", location)
-        if set_cookie:
-            self.send_header("Set-Cookie", SESSION_COOKIE_TMPL.format(token=set_cookie, max_age=SESSION_DAYS * 86400))
-        if clear_cookie:
-            self.send_header("Set-Cookie", "session=; Path=/; HttpOnly; Max-Age=0")
-        self.end_headers()
-
-    def _not_found(self, auth=None):
-        self._send(404, layout("Not found", "", '<div class="panel empty">Page not found.</div>', auth=auth))
-
-    def _forbidden(self, auth=None):
-        self._send(403, layout("Not allowed", "", '<div class="panel empty">You do not have access to that page.</div>', auth=auth))
-
-    def _serve_static(self, path):
-        rel = path[len("/static/"):]
-        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
-        if not full.startswith(STATIC_DIR) or not os.path.isfile(full):
-            return self._not_found()
-        ctype = "text/css" if full.endswith(".css") else "application/octet-stream"
-        with open(full, "rb") as f:
-            self._send(200, f.read(), content_type=ctype)
-
-    # -- helpers --------------------------------------------------------
-
-    def _read_form(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length).decode("utf-8") if length else ""
-        form = parse_qs(raw)
-        return lambda key, default="": form.get(key, [default])[0]
-
-    def _require_workshop(self, conn, msg=None):
-        """Returns auth dict for a logged-in workshop user, or handles the
-        redirect/response itself and returns None."""
-        auth = get_auth(self, conn)
-        if auth is None or auth["user"]["role"] == "platform_admin" or auth["workshop"] is None:
-            self._redirect("/login")
-            return None
-        return auth
-
-    def _require_admin(self, conn):
-        auth = get_auth(self, conn)
-        if auth is None or auth["user"]["role"] != "platform_admin":
-            self._redirect("/login")
-            return None
-        return auth
-
-    # -- GET --------------------------------------------------------------
+        self.wfile.write(resp.body)
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path
         qs = parse_qs(parsed.query)
-        msg = qs.get("msg", [None])[0]
-        err = qs.get("err", [None])[0]
-
-        if path.startswith("/static/"):
-            return self._serve_static(path)
-
-        conn = get_conn()
-        auth = get_auth(self, conn)
-
-        try:
-            if path in ("/", ""):
-                if auth is None:
-                    return self._send(200, page_landing())
-                if auth["user"]["role"] == "platform_admin":
-                    return self._redirect("/admin")
-                return self._redirect("/tips")
-
-            if path == "/signup":
-                if auth: return self._redirect("/tips")
-                return self._send(200, page_signup(err))
-            if path == "/login":
-                if auth:
-                    return self._redirect("/admin" if auth["user"]["role"] == "platform_admin" else "/tips")
-                return self._send(200, page_login(err))
-            if path == "/logout":
-                return self._redirect("/", clear_cookie=True)
-
-            # ---- workshop area ----
-            if path == "/tips":
-                a = self._require_workshop(conn)
-                if not a: return
-                return self._send(200, page_tips_list(qs, a, msg))
-            if path == "/tips/new":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                return self._send(200, page_tip_form(a))
-            if path == "/tips/export.csv":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                rows = conn.execute("SELECT id,topic_number,title,category,function_group,control_unit,fault_codes,model_series,symptom,diagnosis,fix,notes,confirm_count,created_at FROM tips ORDER BY created_at DESC").fetchall()
-                return self._send(200, csv_bytes(rows), "text/csv", {"Content-Disposition": "attachment; filename=tips_export.csv"})
-            if path.startswith("/tips/"):
-                a = self._require_workshop(conn)
-                if not a: return
-                try:
-                    tip_id = int(path.split("/")[2])
-                except (IndexError, ValueError):
-                    return self._not_found(a)
-                html_out = page_tip_detail(tip_id, a, msg)
-                return self._send(200, html_out) if html_out else self._not_found(a)
-
-            if path == "/cases":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                return self._send(200, page_cases_list(qs, a, msg))
-            if path == "/cases/new":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                return self._send(200, page_case_form(a))
-            if path == "/cases/export.csv":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                rows = conn.execute("SELECT * FROM cases WHERE workshop_id=? ORDER BY created_at DESC", (a["workshop"]["id"],)).fetchall()
-                return self._send(200, csv_bytes(rows), "text/csv", {"Content-Disposition": "attachment; filename=cases_export.csv"})
-            if path.startswith("/cases/"):
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                try:
-                    case_id = int(path.split("/")[2])
-                except (IndexError, ValueError):
-                    return self._not_found(a)
-                html_out = page_case_detail(case_id, a, msg)
-                return self._send(200, html_out) if html_out else self._not_found(a)
-
-            if path == "/dashboard":
-                a = self._require_workshop(conn)
-                if not a: return
-                return self._send(200, page_dashboard(a))
-
-            if path == "/account":
-                a = self._require_workshop(conn)
-                if not a: return
-                return self._send(200, page_account(a, msg))
-
-            if path == "/support":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "premium"):
-                    return self._send(200, page_support_locked(a))
-                return self._send(200, page_support_list(a, msg))
-            if path.startswith("/support/"):
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "premium"):
-                    return self._send(200, page_support_locked(a))
-                try:
-                    ticket_id = int(path.split("/")[2])
-                except (IndexError, ValueError):
-                    return self._not_found(a)
-                html_out = page_support_thread(ticket_id, a, msg)
-                return self._send(200, html_out) if html_out else self._not_found(a)
-
-            # ---- admin area ----
-            if path == "/admin":
-                a = self._require_admin(conn)
-                if not a: return
-                return self._send(200, page_admin_dashboard(a))
-            if path == "/admin/workshops":
-                a = self._require_admin(conn)
-                if not a: return
-                return self._send(200, page_admin_workshops(a, msg))
-            if path == "/admin/tickets":
-                a = self._require_admin(conn)
-                if not a: return
-                return self._send(200, page_admin_tickets(qs, a))
-            if path.startswith("/admin/tickets/"):
-                a = self._require_admin(conn)
-                if not a: return
-                try:
-                    ticket_id = int(path.split("/")[3])
-                except (IndexError, ValueError):
-                    return self._not_found(a)
-                html_out = page_admin_ticket_thread(ticket_id, a, msg)
-                return self._send(200, html_out) if html_out else self._not_found(a)
-
-            return self._not_found(auth)
-        finally:
-            conn.close()
-
-    # -- POST ---------------------------------------------------------------
+        cookie_header = self.headers.get("Cookie")
+        if parsed.path.startswith("/static/"):
+            resp = resp_static(parsed.path)
+        else:
+            resp = handle_get(parsed.path, qs, cookie_header)
+        self._write(resp)
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        path = parsed.path
-        f = self._read_form()
-        conn = get_conn()
-
-        try:
-            if path == "/signup":
-                name = f("workshop_name").strip()
-                owner_name = f("owner_name").strip()
-                email = f("email").strip().lower()
-                password = f("password")
-                city = f("city").strip()
-                phone = f("phone").strip()
-                if not (name and owner_name and email and password):
-                    return self._send(200, page_signup("Please fill in all required fields.",
-                                                         dict(workshop_name=name, owner_name=owner_name, email=email, city=city, phone=phone)))
-                existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-                if existing:
-                    return self._send(200, page_signup("That email is already registered. Try logging in instead.",
-                                                         dict(workshop_name=name, owner_name=owner_name, email=email, city=city, phone=phone)))
-                ts = now_str()
-                cur = conn.execute(
-                    "INSERT INTO workshops (name, city, contact_email, phone, tier, status, created_at) VALUES (?,?,?,?,'free','active',?)",
-                    (name, city, email, phone, ts),
-                )
-                workshop_id = cur.lastrowid
-                h, s = hash_password(password)
-                cur2 = conn.execute(
-                    "INSERT INTO users (workshop_id, name, email, password_hash, password_salt, role, created_at) VALUES (?,?,?,?,?,'owner',?)",
-                    (workshop_id, owner_name, email, h, s, ts),
-                )
-                conn.commit()
-                token = create_session(conn, cur2.lastrowid)
-                return self._redirect("/tips?msg=Welcome! You're on the Free tier - browse the Tips library, and upgrade any time from Account.", set_cookie=token)
-
-            if path == "/login":
-                email = f("email").strip().lower()
-                password = f("password")
-                user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-                if not user or not verify_password(password, user["password_hash"], user["password_salt"]):
-                    return self._send(200, page_login("Incorrect email or password.", email))
-                token = create_session(conn, user["id"])
-                dest = "/admin" if user["role"] == "platform_admin" else "/tips"
-                return self._redirect(dest, set_cookie=token)
-
-            # ---- workshop actions ----
-            if path == "/tips/new":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                topic_number = next_number(conn, "tips", "WN")
-                conn.execute(
-                    """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
-                        fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
-                        created_at, confirm_count)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
-                    (topic_number, f("title"), f("category"), f("subcategory"), f("function_group"), f("control_unit"),
-                     f("fault_codes"), f("model_series"), f("symptom"), f("diagnosis"), f("fix"), f("notes"),
-                     "Community", a["workshop"]["id"], a["user"]["name"], now_str()),
-                )
-                conn.commit()
-                return self._redirect("/tips?msg=Tip added to the shared library.")
-
-            if path == "/cases/new":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                workshop_id = a["workshop"]["id"]
-                n = conn.execute("SELECT COUNT(*) AS n FROM cases WHERE workshop_id=?", (workshop_id,)).fetchone()["n"] + 1
-                case_number = f"WS{workshop_id}-CASE-{n:04d}"
-                time_val = f("time_spent_hours")
-                conn.execute(
-                    """INSERT INTO cases (workshop_id, case_number, technician, case_date, vehicle_model, vin, mileage,
-                        function_group, control_unit, fault_codes, symptom, diagnosis_steps, root_cause, fix_applied,
-                        parts_used, time_spent_hours, status, notes, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (workshop_id, case_number, f("technician"), f("case_date") or datetime.now().strftime("%Y-%m-%d"),
-                     f("vehicle_model"), f("vin"), f("mileage"), f("function_group"), f("control_unit"),
-                     f("fault_codes"), f("symptom"), f("diagnosis_steps"), f("root_cause"), f("fix_applied"),
-                     f("parts_used"), float(time_val) if time_val else None, f("status") or "Open",
-                     f("notes"), now_str()),
-                )
-                conn.commit()
-                return self._redirect(f"/cases?msg=Case {case_number} logged.")
-
-            if path.startswith("/cases/") and path.endswith("/promote"):
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                case_id = int(path.split("/")[2])
-                case = conn.execute("SELECT * FROM cases WHERE id=? AND workshop_id=?", (case_id, a["workshop"]["id"])).fetchone()
-                if case is None:
-                    return self._not_found(a)
-                topic_number = next_number(conn, "tips", "WN")
-                title = f("title") or (case["symptom"] or "")[:70]
-                cur = conn.execute(
-                    """INSERT INTO tips (topic_number, title, category, subcategory, function_group, control_unit,
-                        fault_codes, model_series, symptom, diagnosis, fix, notes, source, workshop_id, created_by,
-                        created_at, source_case_id, confirm_count)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
-                    (topic_number, title, "", "", case["function_group"], case["control_unit"], case["fault_codes"],
-                     case["vehicle_model"], case["symptom"], case["diagnosis_steps"], case["fix_applied"],
-                     f"Promoted from a workshop's case log.", "Community", a["workshop"]["id"], a["user"]["name"],
-                     now_str(), case["id"]),
-                )
-                new_tip_id = cur.lastrowid
-                conn.execute("UPDATE cases SET linked_tip_id=? WHERE id=?", (new_tip_id, case_id))
-                conn.commit()
-                return self._redirect(f"/tips/{new_tip_id}?msg=Case {case['case_number']} promoted to shared Tip {topic_number}.")
-
-            if path.startswith("/cases/") and path.endswith("/link"):
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "basic"):
-                    return self._redirect("/account")
-                case_id = int(path.split("/")[2])
-                case = conn.execute("SELECT * FROM cases WHERE id=? AND workshop_id=?", (case_id, a["workshop"]["id"])).fetchone()
-                if case is None:
-                    return self._not_found(a)
-                tip_id = f("tip_id")
-                if tip_id:
-                    conn.execute("UPDATE cases SET linked_tip_id=? WHERE id=?", (tip_id, case_id))
-                    conn.execute("UPDATE tips SET confirm_count = confirm_count + 1 WHERE id=?", (tip_id,))
-                    conn.commit()
-                return self._redirect(f"/cases/{case_id}?msg=Linked to shared tip and confirmation count updated.")
-
-            if path == "/support/new":
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "premium"):
-                    return self._redirect("/account")
-                ts = now_str()
-                cur = conn.execute(
-                    "INSERT INTO tickets (workshop_id, subject, vehicle_model, status, created_at, updated_at) VALUES (?,?,?,'open',?,?)",
-                    (a["workshop"]["id"], f("subject"), f("vehicle_model"), ts, ts),
-                )
-                ticket_id = cur.lastrowid
-                conn.execute(
-                    "INSERT INTO ticket_messages (ticket_id, sender_role, sender_name, message, created_at) VALUES (?,?,?,?,?)",
-                    (ticket_id, "workshop", a["user"]["name"], f("message"), ts),
-                )
-                conn.commit()
-                return self._redirect(f"/support/{ticket_id}?msg=Support ticket sent.")
-
-            if path.startswith("/support/") and path.endswith("/reply"):
-                a = self._require_workshop(conn)
-                if not a: return
-                if not tier_at_least(a["workshop"], "premium"):
-                    return self._redirect("/account")
-                ticket_id = int(path.split("/")[2])
-                ticket = conn.execute("SELECT * FROM tickets WHERE id=? AND workshop_id=?", (ticket_id, a["workshop"]["id"])).fetchone()
-                if ticket is None:
-                    return self._not_found(a)
-                ts = now_str()
-                conn.execute(
-                    "INSERT INTO ticket_messages (ticket_id, sender_role, sender_name, message, created_at) VALUES (?,?,?,?,?)",
-                    (ticket_id, "workshop", a["user"]["name"], f("message"), ts),
-                )
-                conn.execute("UPDATE tickets SET status='open', updated_at=? WHERE id=?", (ts, ticket_id))
-                conn.commit()
-                return self._redirect(f"/support/{ticket_id}?msg=Message sent.")
-
-            # ---- admin actions ----
-            if path.startswith("/admin/workshops/") and path.endswith("/update"):
-                a = self._require_admin(conn)
-                if not a: return
-                workshop_id = int(path.split("/")[3])
-                tier = f("tier")
-                status = f("status")
-                if tier in TIER_RANK and status in WORKSHOP_STATUSES:
-                    conn.execute("UPDATE workshops SET tier=?, status=? WHERE id=?", (tier, status, workshop_id))
-                    conn.commit()
-                return self._redirect("/admin/workshops?msg=Workshop updated.")
-
-            if path.startswith("/admin/tickets/") and path.endswith("/reply"):
-                a = self._require_admin(conn)
-                if not a: return
-                ticket_id = int(path.split("/")[3])
-                ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-                if ticket is None:
-                    return self._not_found(a)
-                ts = now_str()
-                conn.execute(
-                    "INSERT INTO ticket_messages (ticket_id, sender_role, sender_name, message, created_at) VALUES (?,'admin',?,?,?)",
-                    (ticket_id, a["user"]["name"], f("message"), ts),
-                )
-                conn.execute("UPDATE tickets SET status='answered', updated_at=? WHERE id=?", (ts, ticket_id))
-                conn.commit()
-                return self._redirect(f"/admin/tickets/{ticket_id}?msg=Reply sent.")
-
-            if path.startswith("/admin/tickets/") and path.endswith("/close"):
-                a = self._require_admin(conn)
-                if not a: return
-                ticket_id = int(path.split("/")[3])
-                conn.execute("UPDATE tickets SET status='closed', updated_at=? WHERE id=?", (now_str(), ticket_id))
-                conn.commit()
-                return self._redirect(f"/admin/tickets/{ticket_id}?msg=Ticket closed.")
-
-            return self._not_found()
-        finally:
-            conn.close()
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        form = parse_qs(raw.decode("utf-8"))
+        f = lambda key, default="": form.get(key, [default])[0]
+        cookie_header = self.headers.get("Cookie")
+        resp = handle_post(parsed.path, f, cookie_header)
+        self._write(resp)
 
 
 def local_ip():
@@ -1610,8 +1684,13 @@ def local_ip():
     return ip
 
 
+# Initialize the database at import time (not just under __main__) so this
+# works whether the app is launched directly ("python3 app.py", for a VPS or
+# Render/Railway) or imported as a WSGI module by a host like PythonAnywhere,
+# which never executes the __main__ block below.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     ip = local_ip()
     print("=" * 64)
     print(f"{PLATFORM_NAME} is running.")
