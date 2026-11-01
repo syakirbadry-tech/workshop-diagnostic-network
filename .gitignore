@@ -1,0 +1,15 @@
+# Written by app.py at run time. Never commit: the repository is public.
+ADMIN_CREDENTIALS.txt
+workshop_network.db
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local settings (SMTP password and other secrets)
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
