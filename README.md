@@ -33,7 +33,8 @@ keeps hosting simple and cheap.
    Password: <randomly generated>
    ```
    **Save that password somewhere safe** — `ADMIN_CREDENTIALS.txt` is only
-   written once, on first run.
+   written once, on first run. It and the `workshop_network.db` database are
+   listed in `.gitignore` so they are never committed to this public repository.
 4. Open `http://localhost:5000` — you'll see the public landing page.
    - Sign up a test workshop to see the subscriber side.
    - Log in with the admin email/password to see `/admin`.
